@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+anthropic
+langchain-anthropic
+langgraph
+python-dotenv
+pydantic
+httpx
+exa-py
+redis

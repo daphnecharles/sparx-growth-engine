@@ -1,0 +1,33 @@
+# Environment variables
+.env
+.env.*
+
+# Python
+backend/venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Redis dump
+backend/dump.rdb
+dump.rdb
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Node (root-level, frontend has its own .gitignore)
+node_modules/
