@@ -19,6 +19,9 @@ build/
 backend/dump.rdb
 dump.rdb
 
+# SQLite runtime data
+backend/data/
+
 # macOS
 .DS_Store
 

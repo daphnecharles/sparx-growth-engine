@@ -21,6 +21,7 @@ def _apollo_headers() -> dict:
     return {
         "X-Api-Key": APOLLO_API_KEY,
         "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
     }
 
 
@@ -108,6 +109,32 @@ async def enroll_in_apollo_sequence(prospect: dict) -> ApolloEnrollResult:
 
     try:
         async with httpx.AsyncClient(headers=_apollo_headers(), timeout=30) as client:
+            # Step 0: Refuse to enroll into a sequence that's archived/inactive —
+            # Apollo accepts add_contact_ids against one with no error, so contacts
+            # silently pile up with zero outreach unless we check first.
+            campaign_resp = await client.get(
+                f"{APOLLO_BASE_URL}/emailer_campaigns/{APOLLO_SEQUENCE_ID}",
+            )
+            if campaign_resp.is_success:
+                campaign = campaign_resp.json().get("emailer_campaign", {})
+                if campaign.get("archived") or not campaign.get("active"):
+                    logger.error(
+                        "Apollo: sequence %s is archived/inactive — refusing to enroll %r",
+                        APOLLO_SEQUENCE_ID, name,
+                    )
+                    return ApolloEnrollResult(
+                        success=False,
+                        error=(
+                            f"Sequence {APOLLO_SEQUENCE_ID} is archived or inactive in Apollo — "
+                            "reactivate it before approving prospects."
+                        ),
+                    )
+            else:
+                logger.warning(
+                    "Apollo: could not verify sequence %s status (%d) — proceeding anyway",
+                    APOLLO_SEQUENCE_ID, campaign_resp.status_code,
+                )
+
             # Step 1: Create or update contact
             contact_body: dict = {
                 "first_name": first_name,

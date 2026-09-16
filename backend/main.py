@@ -10,10 +10,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 
+import db as _db
 from agents.prospecting_agent import run_full_pipeline, run_prospecting_agent
 from agents.research_agent import run_research_agent
 from integrations.apollo import enroll_in_apollo_sequence
-from integrations.attio import get_list_entry_outreach_status, get_prospect_from_attio, push_prospect_to_attio
+from integrations.attio import (
+    get_list_entry_outreach_status,
+    get_prospect_from_attio,
+    push_prospect_to_attio,
+    update_list_entry_outreach_status,
+)
 from models.pipeline_result import PipelineRunResult
 from models.prospect import ProspectProfile, VerificationError
 from models.prospect_batch import ProspectBatch
@@ -71,6 +77,7 @@ def validate_env() -> None:
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+    _db.init_db()
 
 
 @app.get("/health")
@@ -118,6 +125,11 @@ async def research_prospect(request: ResearchRequest) -> ResearchProspectRespons
     if profile.recommended_action in ("prioritize", "nurture"):
         attio_result = await push_prospect_to_attio(profile)
         attio_synced = attio_result.success
+        if attio_synced and profile.prospect_key:
+            _db.update_prospect(profile.prospect_key, {
+                "attio_person_record_id": attio_result.person_record_id,
+                "attio_list_entry_id": attio_result.list_entry_id,
+            })
 
     return ResearchProspectResponse(**profile.dict(), attio_synced=attio_synced)
 
@@ -132,12 +144,16 @@ def prospect_run() -> ProspectBatch:
 
 class PipelineRunRequest(BaseModel):
     force_refresh: bool = False
+    max_prospects: int = 10
 
 
 @app.post("/api/pipeline/run", response_model=PipelineRunResult)
 async def pipeline_run(request: PipelineRunRequest) -> PipelineRunResult:
     try:
-        return await run_full_pipeline(force_refresh=request.force_refresh)
+        return await run_full_pipeline(
+            force_refresh=request.force_refresh,
+            max_prospects=max(1, min(request.max_prospects, 50)),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -251,14 +267,31 @@ async def attio_webhook(payload: Dict[str, Any]) -> Dict[str, str]:
 
         name = prospect_data.get("name") or person_record_id
         email = prospect_data.get("email")
+        company = prospect_data.get("company")
+
+        local_key = _db.find_prospect_key(email=email, name=name, company=company)
 
         if not email:
             logger.info("Webhook: no email for %r — flagged for LinkedIn DM", name)
+            if local_key:
+                _db.update_prospect(local_key, {"outreach_status": "LinkedIn DM Needed"})
             return {"status": "linkedin_dm_needed", "name": name}
 
         logger.info("Webhook: approved %r (%s) — enrolling in Apollo sequence", name, email)
 
         result = await enroll_in_apollo_sequence(prospect_data)
+
+        # Attio is the source of truth for the approval itself — record it locally
+        # even if the downstream Apollo enrollment fails, so the two systems don't
+        # silently diverge (mirrors /api/prospects/approve's behavior).
+        if local_key:
+            updates: Dict[str, Any] = {"outreach_status": "Approved"}
+            if result.success and result.contact_id:
+                updates["apollo_id"] = result.contact_id
+            _db.update_prospect(local_key, updates)
+        else:
+            logger.warning("Webhook: no matching local record found for %r — outreach_status not synced locally", name)
+
         if result.success:
             return {"status": "enrolled", "name": name}
         else:
@@ -308,51 +341,44 @@ async def apollo_sequence_stats() -> Dict[str, Any]:
 @app.get("/api/prospects/{key:path}", response_model=ProspectProfile)
 async def get_prospect(key: str) -> ProspectProfile:
     """Return a single prospect profile by its prospect_key."""
-    if _redis is None:
-        raise HTTPException(status_code=503, detail="Redis unavailable")
-    raw = _redis.get(f"sparx:profile:{key}")
-    if not raw:
+    data = _db.get_prospect(key)
+    if data is None:
+        # Redis fallback
+        if _redis is not None:
+            raw = _redis.get(f"sparx:profile:{key}")
+            if raw:
+                try:
+                    return ProspectProfile(**json.loads(raw))
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=str(e))
         raise HTTPException(status_code=404, detail="Prospect not found")
     try:
-        return ProspectProfile(**json.loads(raw))
+        return ProspectProfile(**data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/prospects", response_model=List[ProspectProfile])
 async def get_prospects() -> List[ProspectProfile]:
-    """Returns all researched prospect profiles stored in Redis."""
-    if _redis is None:
-        return []
-    try:
-        keys = _redis.smembers("sparx:profile_keys")
-        profiles: List[ProspectProfile] = []
-        for key in keys:
-            raw = _redis.get(f"sparx:profile:{key}")
-            if raw:
-                try:
-                    profiles.append(ProspectProfile(**json.loads(raw)))
-                except Exception:
-                    pass
-        return sorted(profiles, key=lambda p: p.overall_fit_score or 0, reverse=True)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Returns all researched prospect profiles from the database."""
+    rows = _db.get_all_prospects()
+    profiles: List[ProspectProfile] = []
+    for row in rows:
+        try:
+            profiles.append(ProspectProfile(**row))
+        except Exception:
+            pass
+    return sorted(profiles, key=lambda p: p.overall_fit_score or 0, reverse=True)
 
 
 @app.patch("/api/prospects/approve")
 async def approve_prospect(key: str) -> Dict[str, Any]:
-    """Approve a prospect: enroll in Apollo (if email) or flag for LinkedIn DM.
-    Pass the prospect_key as a query parameter: /api/prospects/approve?key={prospect_key}
-    """
-    if _redis is None:
-        raise HTTPException(status_code=503, detail="Redis unavailable")
-
-    raw = _redis.get(f"sparx:profile:{key}")
-    if not raw:
+    """Approve a prospect: enroll in Apollo (if email) or flag for LinkedIn DM."""
+    profile_data = _db.get_prospect(key)
+    if profile_data is None:
         raise HTTPException(status_code=404, detail="Prospect not found")
 
-    profile_data = json.loads(raw)
-
+    updates: Dict[str, Any] = {}
     if profile_data.get("email"):
         try:
             result = await enroll_in_apollo_sequence({
@@ -360,46 +386,44 @@ async def approve_prospect(key: str) -> Dict[str, Any]:
                 "email": profile_data.get("email"),
                 "company": profile_data.get("company"),
                 "title": profile_data.get("role"),
-                "linkedin_url": profile_data.get("source_url_used"),
+                "linkedin_url": profile_data.get("linkedin_url"),
             })
-            profile_data["outreach_status"] = "Approved"
+            updates["outreach_status"] = "Approved"
             if result.success and result.contact_id:
-                profile_data["apollo_id"] = result.contact_id
+                updates["apollo_id"] = result.contact_id
             if not result.success:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "Apollo enrollment failed for %s: %s",
-                    profile_data.get("name"), result.error,
-                )
+                logger.warning("Apollo enrollment failed for %s: %s", profile_data.get("name"), result.error)
         except Exception as e:
-            import logging as _logging
-            _logging.getLogger(__name__).error(
-                "Unexpected error during Apollo enrollment for %s: %s",
-                profile_data.get("name"), e,
-            )
-            profile_data["outreach_status"] = "Approved"
+            logger.error("Unexpected error during Apollo enrollment for %s: %s", profile_data.get("name"), e)
+            updates["outreach_status"] = "Approved"
     else:
-        profile_data["outreach_status"] = "LinkedIn DM Needed"
+        updates["outreach_status"] = "LinkedIn DM Needed"
 
-    _redis.set(f"sparx:profile:{key}", json.dumps(profile_data), ex=7 * 86400)
-    return {"status": "ok", "outreach_status": profile_data["outreach_status"]}
+    _db.update_prospect(key, updates)
+
+    entry_id = profile_data.get("attio_list_entry_id")
+    if entry_id and updates["outreach_status"] == "Approved":
+        ok = await update_list_entry_outreach_status(entry_id, "Approved")
+        if not ok:
+            logger.warning("Failed to sync outreach_status=Approved to Attio for %s", profile_data.get("name"))
+
+    return {"status": "ok", "outreach_status": updates["outreach_status"]}
 
 
 @app.patch("/api/prospects/reject")
 async def reject_prospect(key: str) -> Dict[str, Any]:
-    """Reject a prospect.
-    Pass the prospect_key as a query parameter: /api/prospects/reject?key={prospect_key}
-    """
-    if _redis is None:
-        raise HTTPException(status_code=503, detail="Redis unavailable")
-
-    raw = _redis.get(f"sparx:profile:{key}")
-    if not raw:
+    """Reject a prospect."""
+    profile_data = _db.get_prospect(key)
+    if profile_data is None:
         raise HTTPException(status_code=404, detail="Prospect not found")
+    _db.update_prospect(key, {"outreach_status": "Rejected"})
 
-    profile_data = json.loads(raw)
-    profile_data["outreach_status"] = "Rejected"
-    _redis.set(f"sparx:profile:{key}", json.dumps(profile_data), ex=7 * 86400)
+    entry_id = profile_data.get("attio_list_entry_id")
+    if entry_id:
+        ok = await update_list_entry_outreach_status(entry_id, "Rejected")
+        if not ok:
+            logger.warning("Failed to sync outreach_status=Rejected to Attio for %s", profile_data.get("name"))
+
     return {"status": "ok", "outreach_status": "Rejected"}
 
 

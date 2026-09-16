@@ -35,6 +35,9 @@ class ProspectProfile(BaseModel):
     linkedin_dm_draft: Optional[str] = None
     outreach_status: Optional[str] = None
     prospect_key: Optional[str] = None
+    # Set once synced to Attio — needed to write outreach status changes back to the CRM
+    attio_person_record_id: Optional[str] = None
+    attio_list_entry_id: Optional[str] = None
     # Set by verification node
     verified: bool = False
     confidence: Optional[Literal["high", "medium", "low"]] = None

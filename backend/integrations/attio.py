@@ -35,7 +35,8 @@ def _extract_domain(url: Optional[str]) -> Optional[str]:
     try:
         parsed = urlparse(url if "://" in url else f"https://{url}")
         domain = parsed.netloc or parsed.path
-        domain = domain.lstrip("www.")
+        if domain.startswith("www."):
+            domain = domain[4:]
         return domain or None
     except Exception:
         return None
@@ -132,18 +133,29 @@ async def _create_person(
         values["email_addresses"] = [{"email_address": profile.email}]
     if profile.role:
         values["job_title"] = [{"value": profile.role}]
+    if profile.linkedin_url:
+        values["linkedin"] = [{"value": profile.linkedin_url}]
 
     try:
         resp = await client.post(
             f"{ATTIO_BASE_URL}/objects/people/records",
             json={"data": {"values": values}},
         )
-        if not resp.is_success:
-            logger.error("Attio: error creating person %r: %d %s", profile.name, resp.status_code, resp.text)
-            return None
-        record_id = resp.json()["data"]["id"]["record_id"]
-        logger.info("Attio: created person %r", profile.name)
-        return record_id
+        if resp.is_success:
+            record_id = resp.json()["data"]["id"]["record_id"]
+            logger.info("Attio: created person %r", profile.name)
+            return record_id
+        body = resp.json()
+        # Email uniqueness conflict — person already exists; reuse the existing record
+        # (mirrors the company dedup handling above)
+        if body.get("code") == "uniqueness_conflict":
+            match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", body.get("message", ""))
+            if match:
+                record_id = match.group(0)
+                logger.info("Attio: person already exists, reusing %r", profile.name)
+                return record_id
+        logger.error("Attio: error creating person %r: %d %s", profile.name, resp.status_code, resp.text)
+        return None
     except Exception as e:
         logger.warning("Attio: person create failed for %r: %s", profile.name, e)
         return None
@@ -209,8 +221,8 @@ async def _add_to_list(
     client: httpx.AsyncClient,
     person_record_id: str,
     profile: ProspectProfile,
-) -> None:
-    """Add the person to the prospect list. Non-fatal."""
+) -> Optional[str]:
+    """Add the person to the prospect list. Returns entry_id or None. Non-fatal."""
     try:
         resp = await client.post(
             f"{ATTIO_BASE_URL}/lists/{_PROSPECT_LIST_ID}/entries",
@@ -224,10 +236,12 @@ async def _add_to_list(
         )
         if not resp.is_success:
             logger.error("Attio: error adding %r to list: %d %s", profile.name, resp.status_code, resp.text)
-            return
+            return None
         logger.info("Attio: added %r to prospect list", profile.name)
+        return resp.json()["data"]["id"]["entry_id"]
     except Exception as e:
         logger.warning("Attio: list entry failed for person %r: %s", person_record_id, e)
+        return None
 
 
 # ── Public interface ─────────────────────────────────────────────────────────────
@@ -235,6 +249,52 @@ async def _add_to_list(
 _OUTREACH_STATUS_ATTR_ID = os.environ.get(
     "ATTIO_OUTREACH_STATUS_ATTR_ID", "480f90f7-7094-49bf-ae2a-d9ef39d8801c"
 )
+
+
+# Outreach Status select-attribute option IDs (list-scoped, fetched from
+# GET /v2/lists/{list_id}/attributes/{attr_id}/options). Attio requires the
+# option_id — not the display text — when writing a select attribute.
+_OUTREACH_STATUS_OPTION_IDS = {
+    "Pending Review": os.environ.get("ATTIO_OUTREACH_OPTION_PENDING", "f38daaaa-307d-4d76-a7f1-9a364bd4ed99"),
+    "Approved": os.environ.get("ATTIO_OUTREACH_OPTION_APPROVED", "e9a8168f-88ff-4ddc-bd62-db46ce5a2855"),
+    "Rejected": os.environ.get("ATTIO_OUTREACH_OPTION_REJECTED", "6865d82c-a4c8-452f-a051-631daef81f3e"),
+}
+
+
+async def update_list_entry_outreach_status(entry_id: str, status: str) -> bool:
+    """
+    Write the Outreach Status select attribute on a list entry.
+    `status` must be one of the keys in _OUTREACH_STATUS_OPTION_IDS.
+    Returns True on success, False otherwise. Never raises.
+    """
+    if not ATTIO_API_KEY:
+        return False
+
+    option_id = _OUTREACH_STATUS_OPTION_IDS.get(status)
+    if not option_id:
+        logger.error("Attio: unknown outreach status %r — cannot update list entry %s", status, entry_id)
+        return False
+
+    try:
+        async with httpx.AsyncClient(headers=_attio_headers(), timeout=15) as client:
+            resp = await client.patch(
+                f"{ATTIO_BASE_URL}/lists/{_PROSPECT_LIST_ID}/entries/{entry_id}",
+                json={
+                    "data": {
+                        "entry_values": {
+                            "outreach_status": [{"option": option_id}],
+                        }
+                    }
+                },
+            )
+        if not resp.is_success:
+            logger.error("Attio: error updating outreach status for entry %s: %d %s", entry_id, resp.status_code, resp.text)
+            return False
+        logger.info("Attio: set outreach_status=%r for entry %s", status, entry_id)
+        return True
+    except Exception as e:
+        logger.error("Attio: outreach status update failed for entry %s: %s", entry_id, e)
+        return False
 
 
 async def get_list_entry_outreach_status(entry_id: str) -> Optional[str]:
@@ -259,13 +319,10 @@ async def get_list_entry_outreach_status(entry_id: str) -> Optional[str]:
 
         entry_data = resp.json()
 
+        outreach_status_entries = entry_data.get("data", {}).get("entry_values", {}).get("outreach_status") or []
         status_value = (
-            entry_data
-            .get("data", {})
-            .get("entry_values", {})
-            .get("outreach_status", [{}])[0]
-            .get("option", {})
-            .get("title", None)
+            outreach_status_entries[0].get("option", {}).get("title")
+            if outreach_status_entries else None
         )
 
         logger.debug("Attio: outreach_status for entry %s: %r", entry_id, status_value)
@@ -359,13 +416,14 @@ async def push_prospect_to_attio(profile: ProspectProfile) -> AttioSyncResult:
             note_id = await _add_note(client, person_record_id, profile)
 
             # Step 5: List entry (non-fatal)
-            await _add_to_list(client, person_record_id, profile)
+            list_entry_id = await _add_to_list(client, person_record_id, profile)
 
         return AttioSyncResult(
             success=True,
             person_record_id=person_record_id,
             company_record_id=company_record_id,
             note_id=note_id,
+            list_entry_id=list_entry_id,
         )
 
     except Exception as e:

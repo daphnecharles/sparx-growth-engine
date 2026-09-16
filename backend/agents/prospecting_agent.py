@@ -11,6 +11,7 @@ import redis as redis_lib
 from dotenv import load_dotenv
 from exa_py import Exa
 
+import db as _db
 from integrations.attio import push_prospect_to_attio
 from models.pipeline_result import PipelineRunResult
 from models.prospect import ProspectProfile
@@ -42,7 +43,7 @@ except Exception as _e:
 _PROSPECTED_URL_TTL = 3 * 86400  # 3 days
 
 # Limit concurrent research graph executions to avoid overwhelming Claude / Exa APIs
-_research_semaphore = asyncio.Semaphore(2)
+_research_semaphore = asyncio.Semaphore(5)
 
 
 # ── ICP definition ─────────────────────────────────────────────────────────────
@@ -73,8 +74,13 @@ EXA_QUERIES: List[str] = [
     "course creator founder site:linkedin.com",
 ]
 
-MAX_RESULTS_PER_QUERY = 5
-MAX_BATCH_SIZE = 25
+MAX_RESULTS_PER_QUERY = 6
+MAX_BATCH_SIZE = 20
+
+# Company size ceiling for the ICP — above this, the course is a poor fit (too
+# many employees / systems already in place). Raised from 50 to widen the pool
+# of qualifying small businesses without touching lead-quality logic.
+MAX_COMPANY_EMPLOYEES = 200
 
 
 # ── Step 1: Exa result parsing ──────────────────────────────────────────────────
@@ -211,7 +217,7 @@ def _redis_mark_url(normalized_url: str) -> None:
 
 # ── Main entry point ────────────────────────────────────────────────────────────
 
-def run_prospecting_agent() -> ProspectBatch:
+def run_prospecting_agent(max_prospects: int = MAX_BATCH_SIZE) -> ProspectBatch:
     """
     Two-step prospecting pipeline:
       1. Exa keyword search discovers LinkedIn profiles.
@@ -219,11 +225,12 @@ def run_prospecting_agent() -> ProspectBatch:
     Falls back to raw Exa data when Apollo match fails.
     """
     seen_urls: Set[str] = set()
+    seen_names: Set[str] = set()
     leads: List[ProspectLead] = []
     total_skipped = 0
 
     for query in EXA_QUERIES:
-        if len(leads) >= MAX_BATCH_SIZE:
+        if len(leads) >= max_prospects:
             break
 
         # ── Step 1: Exa discovery ───────────────────────────────────────────
@@ -239,7 +246,7 @@ def run_prospecting_agent() -> ProspectBatch:
             continue
 
         for result in exa_response.results:
-            if len(leads) >= MAX_BATCH_SIZE:
+            if len(leads) >= max_prospects:
                 break
 
             try:
@@ -287,7 +294,7 @@ def run_prospecting_agent() -> ProspectBatch:
                             company = ap_company
 
                         # Quality filter: skip large organisations
-                        if num_employees is not None and num_employees > 50:
+                        if num_employees is not None and num_employees > MAX_COMPANY_EMPLOYEES:
                             continue
 
                 # ── Step 3: Quality filters ─────────────────────────────────
@@ -303,7 +310,19 @@ def run_prospecting_agent() -> ProspectBatch:
                     total_skipped += 1
                     continue
 
+                # ── Step 5: Identity dedup — skip if this person was already discovered
+                # under a different URL, either earlier in this same run or in a
+                # previous run (different page/site turning up in another search) ──
+                name_key = prospect_name.strip().lower()
+                if name_key in seen_names:
+                    total_skipped += 1
+                    continue
+                if _db.find_prospect_key(name=prospect_name):
+                    total_skipped += 1
+                    continue
+
                 seen_urls.add(norm_url)
+                seen_names.add(name_key)
                 leads.append(ProspectLead(
                     prospect_name=prospect_name,
                     prospect_url=prospect_url,
@@ -343,104 +362,110 @@ def _pipeline_log(msg: str) -> None:
 
 # ── Pipeline orchestrator ───────────────────────────────────────────────────────
 
-async def run_full_pipeline(force_refresh: bool = False) -> PipelineRunResult:
+async def run_full_pipeline(force_refresh: bool = False, max_prospects: int = MAX_BATCH_SIZE) -> PipelineRunResult:
     """
     End-to-end pipeline:
       1. ProspectingAgent discovers leads via Exa + Apollo enrichment.
-      2. Each lead is fed into the research graph (run_research_agent).
+      2. All leads are researched concurrently (semaphore caps at 5).
       3. Results are aggregated into a PipelineRunResult.
-
-    A semaphore caps concurrent research graph executions at 3 to avoid
-    overwhelming Claude and Exa APIs. A 2-second delay is inserted between
-    each prospect to further reduce API pressure.
     """
     _pipeline_log("PIPELINE STARTED")
 
-    # Lazy import avoids a circular dependency at module load time
     from agents.research_agent import run_research_agent
 
     start_time = time.time()
 
-    batch = run_prospecting_agent()
+    _pipeline_log("Discovering leads via Exa + Apollo...")
+    batch = await asyncio.to_thread(run_prospecting_agent, max_prospects=max_prospects)
     prospects = batch.prospects
     total = len(prospects)
+    _pipeline_log(
+        f"Discovery complete: {total} leads to research "
+        f"({batch.total_skipped_duplicates} duplicates skipped)"
+    )
 
-    profiles: List[ProspectProfile] = []
-    total_prioritized = 0
-    total_deprioritized = 0
-    total_flagged = 0
-    total_attio_synced = 0
+    attio_synced_count = 0
 
-    for idx, prospect in enumerate(prospects, 1):
+    async def _research_one(idx: int, prospect: ProspectLead):
+        nonlocal attio_synced_count
         name = prospect.prospect_name or "Unknown"
-        url = prospect.prospect_url
-        company = prospect.company
-
-        _pipeline_log(f"[{idx}/{total}] Processing: {prospect.prospect_name}")
+        _pipeline_log(f"[{idx}/{total}] Processing: {name}")
         try:
             async with _research_semaphore:
                 profile = await asyncio.to_thread(
                     run_research_agent,
                     name=prospect.prospect_name,
-                    linkedin_url=url,
-                    company=company,
+                    linkedin_url=prospect.prospect_url,
+                    company=prospect.company,
                     force_refresh=force_refresh,
                 )
-
+            score = profile.overall_fit_score
+            score_label = f"{score:.1f}" if score is not None else "N/A"
+            check = "✓" if profile.recommended_action in ("prioritize", "nurture") else "✗"
+            _pipeline_log(f"[{idx}/{total}] {name} — {profile.recommended_action} ({score_label}) {check}")
+            if profile.recommended_action in ("prioritize", "nurture"):
+                attio_result = await push_prospect_to_attio(profile)
+                if attio_result.success:
+                    attio_synced_count += 1
+                    _pipeline_log(f"[Attio] Synced: {name} → {profile.recommended_action}")
+                    if profile.prospect_key:
+                        try:
+                            import db as _db
+                            _db.update_prospect(profile.prospect_key, {
+                                "attio_person_record_id": attio_result.person_record_id,
+                                "attio_list_entry_id": attio_result.list_entry_id,
+                            })
+                        except Exception as e:
+                            logger.warning("Failed to persist Attio IDs for %s: %s", name, e)
+                else:
+                    _pipeline_log(f"[Attio] Sync failed for {name}: {attio_result.error}")
+            return profile
         except ValueError as e:
             detail = str(e)
-            is_flagged = False
-            is_platform_warning = False
             try:
                 parsed = json.loads(detail)
                 if isinstance(parsed, dict):
                     if parsed.get("flagged_for_review"):
-                        is_flagged = True
+                        _pipeline_log(f"[{idx}/{total}] {name} — flagged for review")
+                        return "flagged"
                     elif parsed.get("platform_warning"):
-                        is_platform_warning = True
+                        _pipeline_log(f"[{idx}/{total}] {name} — skipped (no public web presence)")
+                        return None
             except (json.JSONDecodeError, TypeError):
                 pass
-
-            if is_flagged:
-                total_flagged += 1
-                _pipeline_log(f"[{idx}/{total}] {name} — flagged for review")
-            elif is_platform_warning:
-                _pipeline_log(f"[{idx}/{total}] {name} — skipped (no public web presence)")
-            else:
-                _pipeline_log(f"[{idx}/{total}] {name} — error: {detail[:80]}")
-
-            if idx < total:
-                await asyncio.sleep(2)
-            continue
-
+            _pipeline_log(f"[{idx}/{total}] {name} — error: {detail[:80]}")
+            return None
         except Exception as e:
             _pipeline_log(f"[{idx}/{total}] {name} — unexpected error: {e}")
-            if idx < total:
-                await asyncio.sleep(2)
-            continue
+            return None
 
-        profiles.append(profile)
+    results = await asyncio.gather(*[
+        _research_one(idx, prospect)
+        for idx, prospect in enumerate(prospects, 1)
+    ])
 
-        score = profile.overall_fit_score
-        if score is not None and score >= 4.0:
-            total_prioritized += 1
-            _pipeline_log(f"[{idx}/{total}] {name} — prioritize ({score:.1f}) ✓")
+    profiles: List[ProspectProfile] = []
+    total_prioritized = 0
+    total_deprioritized = 0
+    total_flagged = 0
+
+    for result in results:
+        if result == "flagged":
+            total_flagged += 1
+        elif result is None:
+            pass
         else:
-            total_deprioritized += 1
-            score_label = f"{score:.1f}" if score is not None else "N/A"
-            _pipeline_log(f"[{idx}/{total}] {name} — deprioritize ({score_label}) ✗")
-
-        # ── Attio sync for prioritize / nurture prospects ───────────────────
-        if profile.recommended_action in ("prioritize", "nurture"):
-            attio_result = await push_prospect_to_attio(profile)
-            if attio_result.success:
-                total_attio_synced += 1
-                _pipeline_log(f"[Attio] Synced: {name} → {profile.recommended_action}")
+            profiles.append(result)
+            if result.recommended_action in ("prioritize", "nurture"):
+                total_prioritized += 1
             else:
-                _pipeline_log(f"[Attio] Sync failed for {name}: {attio_result.error}")
+                total_deprioritized += 1
 
-        if idx < total:
-            await asyncio.sleep(2)
+    _pipeline_log(
+        f"PIPELINE COMPLETE: {len(profiles)} researched, {total_prioritized} prioritized, "
+        f"{total_flagged} flagged, {attio_synced_count} synced to Attio "
+        f"({round(time.time() - start_time, 1)}s)"
+    )
 
     return PipelineRunResult(
         total_prospects_found=batch.total_found,
@@ -450,7 +475,7 @@ async def run_full_pipeline(force_refresh: bool = False) -> PipelineRunResult:
         total_flagged_for_review=total_flagged,
         total_skipped_duplicates=batch.total_skipped_duplicates,
         profiles=profiles,
-        attio_synced=total_attio_synced,
+        attio_synced=attio_synced_count,
         run_timestamp=datetime.utcnow(),
         run_duration_seconds=round(time.time() - start_time, 2),
     )

@@ -20,7 +20,7 @@ An AI-powered prospect research and outreach pipeline for Sparx Labs' "AI for En
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                      Frontend (Next.js 15)               │
+│                      Frontend (Next.js 16)               │
 │  Dashboard · Prospects Table · Profile Detail · Analytics│
 └───────────────────────┬─────────────────────────────────┘
                         │ HTTP (axios)
@@ -33,21 +33,28 @@ An AI-powered prospect research and outreach pipeline for Sparx Labs' "AI for En
 │  └─────────────────────┘   └──────────────────────────┘ │
 │                                        │                 │
 │  ┌─────────────────────────────────────▼──────────────┐ │
-│  │                    Redis                            │ │
-│  │  Profile store · Pipeline logs · URL dedup cache   │ │
+│  │             SQLite (primary store)                   │ │
+│  │  Durable prospect profiles · read/written by all     │ │
+│  │  endpoints and agents (backend/data/sparx.db)         │ │
+│  └─────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │             Redis (optional, best-effort)             │ │
+│  │  Research cache · pipeline logs · URL dedup cache ·   │ │
+│  │  single-profile fallback if SQLite lookup misses      │ │
 │  └─────────────────────────────────────────────────────┘ │
 │                                                          │
 │  ┌──────────────┐  ┌─────────────┐  ┌────────────────┐  │
 │  │  Attio CRM   │  │  Apollo.io  │  │  Exa Search    │  │
-│  │  (sync/hook) │  │  (sequence) │  │  (web search)  │  │
+│  │ (bidirectional│  │  (sequence) │  │  (web search)  │  │
+│  │  sync + hook) │  │             │  │                │  │
 │  └──────────────┘  └─────────────┘  └────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Technology |
 |---|---|
-| Frontend | Next.js 15 App Router, TanStack Query, Tailwind CSS v4 |
-| Backend | FastAPI, LangGraph, Redis |
+| Frontend | Next.js 16 App Router, TanStack Query, Tailwind CSS v4 (Satoshi + Rubik, Sparx brand palette) |
+| Backend | FastAPI, LangGraph, SQLite (primary store), Redis (optional cache) |
 | AI | Anthropic Claude (Sonnet 4.6 + Haiku 4.5) |
 | Discovery | Exa neural search |
 | Enrichment | Apollo.io (email + sequence enrollment) |
@@ -154,7 +161,7 @@ sparx-growth-engine/
 │   │   ├── research_agent.py      # LangGraph pipeline (7 nodes)
 │   │   └── prospecting_agent.py   # Exa + Apollo discovery + pipeline orchestrator
 │   ├── integrations/
-│   │   ├── attio.py               # Attio CRM sync (people, companies, notes, lists)
+│   │   ├── attio.py               # Attio CRM sync (people, companies, notes, lists, outreach status R/W)
 │   │   └── apollo.py              # Apollo contact creation + sequence enrollment
 │   ├── models/
 │   │   ├── prospect.py            # ProspectProfile Pydantic model
@@ -162,6 +169,8 @@ sparx-growth-engine/
 │   │   ├── pipeline_result.py     # PipelineRunResult
 │   │   ├── attio_result.py        # AttioSyncResult
 │   │   └── apollo_result.py       # ApolloEnrollResult
+│   ├── data/                      # SQLite DB file lives here (gitignored)
+│   ├── db.py                      # SQLite persistence — primary prospect store
 │   ├── main.py                    # FastAPI app + all endpoints
 │   └── requirements.txt
 └── frontend/
@@ -175,6 +184,7 @@ sparx-growth-engine/
         │   └── sequences/page.tsx  # Apollo sequence stats + LinkedIn DM queue
         ├── components/
         │   ├── Sidebar.tsx
+        │   ├── Logo.tsx            # Sparx wordmark + gradient star mark
         │   └── Providers.tsx       # TanStack Query provider
         └── lib/
             └── api.ts              # Typed API client (axios)
@@ -190,8 +200,8 @@ sparx-growth-engine/
 | `POST` | `/api/research-prospect` | Research a single prospect by name/URL/company |
 | `POST` | `/api/prospect/run` | Run prospecting agent (Exa + Apollo discovery) |
 | `POST` | `/api/pipeline/run` | Run full end-to-end pipeline |
-| `GET` | `/api/prospects` | All researched profiles from Redis |
-| `GET` | `/api/prospects/{key}` | Single prospect profile by key |
+| `GET` | `/api/prospects` | All researched profiles from the local SQLite store |
+| `GET` | `/api/prospects/{key}` | Single prospect profile by key (SQLite, falls back to Redis) |
 | `PATCH` | `/api/prospects/approve?key={key}` | Approve → enroll in Apollo or flag for LinkedIn DM |
 | `PATCH` | `/api/prospects/reject?key={key}` | Reject a prospect |
 | `GET` | `/api/pipeline/logs` | Last 100 pipeline log lines |
@@ -203,12 +213,15 @@ sparx-growth-engine/
 
 ---
 
-## Redis Keys
+## Storage
+
+**SQLite** (`backend/data/sparx.db`, via `backend/db.py`) is the primary, durable store for prospect profiles. Every profile produced by the research agent is upserted here, keyed by `prospect_key` (the source URL, or `{name}:{company}` if no URL). `GET /api/prospects`, `GET /api/prospects/{key}`, and the approve/reject endpoints all read/write through it. No setup required — it's the Python stdlib `sqlite3` module, WAL mode, no external dependency.
+
+**Redis** is optional and used only for caching and ephemeral state — the app runs fine without it (falls back gracefully with a warning at startup):
 
 | Key | TTL | Contents |
 |---|---|---|
-| `sparx:profile:{key}` | 7 days | Individual `ProspectProfile` JSON |
-| `sparx:profile_keys` | — | Set of all profile keys (used by `GET /api/prospects`) |
+| `sparx:profile:{key}` | 7 days | Individual `ProspectProfile` JSON — fallback for `GET /api/prospects/{key}` if not yet in SQLite |
 | `sparx:pipeline_logs` | — | List of pipeline log lines (capped at 500) |
 | `prospect:{name}:{company}` | 24 hours | Research cache (avoids re-running the graph) |
 | `prospected_url:{url}` | 3 days | URL dedup cache (avoids re-discovering the same person) |
@@ -220,8 +233,8 @@ sparx-growth-engine/
 ### Prerequisites
 
 - Python 3.9+
-- Node.js 18+
-- Redis (local or remote)
+- Node.js 20+ (Next.js 16 requirement)
+- Redis (optional — caching/dedup only; prospect data persists to SQLite regardless)
 - API keys for: Anthropic, Exa, Apollo, Attio
 
 ### Environment Variables
@@ -244,6 +257,14 @@ APOLLO_EMAIL_ACCOUNT_ID=...
 # Attio list/attribute config (defaults to hardcoded IDs if omitted)
 ATTIO_PROSPECT_LIST_ID=...
 ATTIO_OUTREACH_STATUS_ATTR_ID=...
+
+# Attio Outreach Status select-attribute option IDs — required to write the
+# status back to Attio on approve/reject (defaults to hardcoded IDs if omitted;
+# re-fetch via GET /v2/lists/{list_id}/attributes/{attr_id}/options if your
+# Attio workspace's option IDs differ)
+ATTIO_OUTREACH_OPTION_PENDING=...
+ATTIO_OUTREACH_OPTION_APPROVED=...
+ATTIO_OUTREACH_OPTION_REJECTED=...
 
 # Redis (defaults to localhost)
 REDIS_URL=redis://localhost:6379
@@ -274,13 +295,15 @@ npm run dev   # runs on http://localhost:3000
 
 ## Human-in-the-Loop Flow
 
-The pipeline never sends outreach automatically. Every prospect goes through a manual review step:
+The pipeline never sends outreach automatically. Every prospect goes through a manual review step, and can be approved/rejected from either the dashboard or directly in Attio — the two stay in sync in both directions:
 
-1. Pipeline runs and stores all researched profiles in Redis
+1. Pipeline runs and persists all researched profiles to SQLite (`backend/data/sparx.db`)
 2. Reviewer opens `/prospects` and sees all prospects sorted by fit score
 3. Prospects without email are highlighted — their LinkedIn DM draft is pre-written and ready to copy
-4. Reviewer clicks **Approve** or **Reject** on each prospect
+4. Reviewer clicks **Approve** or **Reject** on each prospect (`PATCH /api/prospects/approve|reject`)
 5. On approval:
    - If the prospect has an email → creates a contact in Apollo and enrolls them in the configured sequence
    - If no email → marks status as "LinkedIn DM Needed" for manual follow-up
-6. Attio webhook can also trigger enrollment when a prospect's Outreach Status is updated to "Approved" directly in the CRM
+6. Both approve and reject write the Outreach Status back to the prospect's Attio list entry (when it's been synced there), so the CRM always reflects the local decision
+7. Conversely, updating a prospect's Outreach Status to "Approved" directly in Attio fires a webhook (`POST /api/webhooks/attio`) that enrolls them in Apollo and updates the local SQLite record — the local status reflects the Attio approval even if the downstream Apollo enrollment fails, so the two systems never silently diverge
+8. Apollo enrollment refuses to run (and returns a clear error) if the configured sequence is archived or inactive, rather than silently creating contacts that will never receive outreach

@@ -120,7 +120,9 @@ PLATFORM_MAP = {
 def get_platform(url: str) -> str:
     """Return a normalized platform name for a URL."""
     try:
-        domain = urlparse(url).netloc.lower().lstrip("www.")
+        domain = urlparse(url).netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
         for known_domain, platform in PLATFORM_MAP.items():
             if domain == known_domain or domain.endswith(f".{known_domain}"):
                 return platform
@@ -1003,6 +1005,18 @@ No markdown fences."""
             # Suppress course recommendation when prospect is not a good fit
             suppress_pitch = disqualified or overall_fit_score < 3.0
 
+            # Enforce the action bucket in code rather than trusting the model's
+            # recommended_action — disqualified/low-score prospects must never
+            # end up "prioritize"/"nurture" and get pushed to Attio/Apollo.
+            if disqualified:
+                recommended_action = "deprioritize"
+            elif overall_fit_score >= 3.5:
+                recommended_action = "prioritize"
+            elif overall_fit_score >= 2.5:
+                recommended_action = "nurture"
+            else:
+                recommended_action = "deprioritize"
+
             profile_data = profile.dict()
             profile_data.update({
                 "disqualified": disqualified,
@@ -1011,7 +1025,7 @@ No markdown fences."""
                 "outreach_priority": outreach_priority,
                 "overall_fit_score": overall_fit_score,
                 "fit_summary": data["fit_summary"],
-                "recommended_action": data["recommended_action"],
+                "recommended_action": recommended_action,
                 "recommended_course_angle": None if suppress_pitch else profile_data.get("recommended_course_angle"),
             })
             return {
@@ -1125,7 +1139,7 @@ def after_analysis(state: ProspectState) -> str:
 
 
 def after_verification(state: ProspectState) -> str:
-    if state.get("error") or state.get("errors"):
+    if state.get("error"):
         return END
     if state.get("verification_error"):
         return END
@@ -1136,7 +1150,7 @@ def after_verification(state: ProspectState) -> str:
 
 
 def after_fit_scoring(state: ProspectState) -> str:
-    if state.get("error") or state.get("errors"):
+    if state.get("error"):
         return END
     profile = state.get("profile")
     if profile is None:
@@ -1178,6 +1192,35 @@ def _cache_set(name: str, profile: ProspectProfile, company: Optional[str] = Non
         logger.warning("Cache write failed: %s", e)
 
 
+# ── Live progress logging ────────────────────────────────────────────────────
+
+_NODE_PROGRESS_LABELS = {
+    "platform_detection": "detecting platform & source",
+    "contact_enrichment": "finding contact details",
+    "research": "gathering research",
+    "analysis": "analyzing profile with Claude",
+    "verification": "verifying profile accuracy",
+    "fit_scoring": "scoring course fit",
+    "course_angle": "drafting LinkedIn DM",
+}
+
+
+def _log_progress(label: str, node: str) -> None:
+    """Append a per-step progress line to the shared pipeline log, visible live
+    in the dashboard. Mirrors prospecting_agent._pipeline_log — best-effort,
+    never raises, no-op if Redis is unavailable."""
+    if _redis is None:
+        return
+    friendly = _NODE_PROGRESS_LABELS.get(node)
+    if not friendly:
+        return
+    try:
+        _redis.rpush("sparx:pipeline_logs", f"  {label}: {friendly}...")
+        _redis.ltrim("sparx:pipeline_logs", -500, -1)
+    except Exception as e:
+        logger.warning("Failed to write progress log: %s", e)
+
+
 # ── Graph assembly ─────────────────────────────────────────────────────────────
 
 def build_graph() -> Any:
@@ -1204,6 +1247,59 @@ def build_graph() -> Any:
 
 
 _graph = build_graph()
+
+
+# ── Flagged-profile persistence ─────────────────────────────────────────────────
+
+def _persist_flagged_profile(
+    result: Dict[str, Any],
+    name: Optional[str],
+    company: Optional[str],
+    linkedin_url: Optional[str],
+    verification_error: VerificationError,
+) -> None:
+    """
+    Persist a low-confidence profile for manual review instead of silently
+    dropping it. Called right before run_research_agent raises for a
+    verification failure — the analyzed (pre-fit-scoring) profile is still
+    present in the graph state at this point. Never raises.
+    """
+    profile = result.get("profile")
+    if profile is None:
+        return
+
+    try:
+        profile_data = profile.dict()
+        profile_data.update({
+            "linkedin_url": linkedin_url,
+            "website_url": result.get("website_url"),
+            "email": result.get("email"),
+            "instagram_url": result.get("instagram_url"),
+            "twitter_url": result.get("twitter_url"),
+            "facebook_url": result.get("facebook_url"),
+            "contact_enrichment_confidence": result.get("contact_enrichment_confidence"),
+            "verified": False,
+            "confidence": "low",
+            "outreach_status": "Flagged for Review",
+            "fit_summary": verification_error.reason,
+        })
+        flagged_profile = ProspectProfile(**profile_data)
+
+        if not flagged_profile.prospect_key:
+            flagged_profile = ProspectProfile(**{
+                **flagged_profile.dict(),
+                "prospect_key": flagged_profile.source_url_used or f"{(name or '').lower()}:{(company or '').lower()}",
+            })
+
+        import db as _db
+        existing_key = _db.find_prospect_key(email=flagged_profile.email, name=flagged_profile.name)
+        if existing_key and existing_key != flagged_profile.prospect_key:
+            flagged_profile = ProspectProfile(**{**flagged_profile.dict(), "prospect_key": existing_key})
+
+        _db.upsert_prospect(flagged_profile.dict())
+        logger.info("Persisted flagged-for-review profile: %r", flagged_profile.name)
+    except Exception as e:
+        logger.warning("Failed to persist flagged profile for %r: %s", name, e)
 
 
 # ── Public interface ───────────────────────────────────────────────────────────
@@ -1250,7 +1346,15 @@ def run_research_agent(
         ),
     }
 
-    result = _graph.invoke(initial_state)
+    progress_label = name or linkedin_url or "prospect"
+    result: Dict[str, Any] = initial_state  # fallback if the graph yields nothing
+    last_logged_node: Optional[str] = None
+    for state_snapshot in _graph.stream(initial_state, stream_mode="values"):
+        result = state_snapshot
+        node = result.get("current_node")
+        if node and node != last_logged_node:
+            last_logged_node = node
+            _log_progress(progress_label, node)
 
     error = result.get("error")
     if error:
@@ -1263,6 +1367,7 @@ def run_research_agent(
     verification_error = result.get("verification_error")
     if verification_error:
         ve = verification_error if isinstance(verification_error, VerificationError) else VerificationError(**verification_error)
+        _persist_flagged_profile(result, name, company, linkedin_url, ve)
         raise ValueError(json.dumps(ve.dict()))
 
     profile = result.get("profile")
@@ -1291,6 +1396,21 @@ def run_research_agent(
         profile_data["prospect_key"] = profile.source_url_used or f"{(name or '').lower()}:{(company or '').lower()}"
         profile = ProspectProfile(**profile_data)
 
+    # ── Reconcile against an existing record for the same person ────────────────
+    # Dedup safety net for callers that bypass the prospecting agent (e.g. direct
+    # /api/research-prospect calls): if we already have this person stored under a
+    # different prospect_key (a different source URL), reuse that key so this
+    # research updates the existing row instead of creating a duplicate.
+    try:
+        import db as _db
+        existing_key = _db.find_prospect_key(email=profile.email, name=profile.name)
+        if existing_key and existing_key != profile.prospect_key:
+            profile_data = profile.dict()
+            profile_data["prospect_key"] = existing_key
+            profile = ProspectProfile(**profile_data)
+    except Exception as e:
+        logger.warning("Dedup lookup failed for %r: %s", profile.name, e)
+
     # ── Cache write ────────────────────────────────────────────────────────────
     if name:
         _cache_set(name, profile, company)
@@ -1304,5 +1424,12 @@ def run_research_agent(
             pipe.execute()
         except Exception as e:
             logger.warning("Failed to index profile in Redis: %s", e)
+
+    # ── Persist to SQLite (primary durable store) ──────────────────────────────
+    try:
+        import db as _db
+        _db.upsert_prospect(profile.dict())
+    except Exception as e:
+        logger.warning("Failed to persist profile to SQLite: %s", e)
 
     return profile
