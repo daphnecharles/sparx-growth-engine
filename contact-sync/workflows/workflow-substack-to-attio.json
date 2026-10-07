@@ -1,0 +1,259 @@
+{
+  "name": "Sparx | Substack (Gmail) \u2192 Attio",
+  "nodes": [
+    {
+      "id": "eeead55c-69f0-52e8-b2ab-1afffd4482d2",
+      "name": "Gmail: new Substack notification",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 5,
+              "unit": "minutes"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "label:substack-subscribers"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "sparxGmailSubstack",
+          "name": "Gmail (Substack notifications)"
+        }
+      }
+    },
+    {
+      "id": "c2287035-51e4-556b-b817-e2def077d829",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "6c1912a2-e285-561a-a75d-e5a07599cdef",
+              "name": "_publisher_emails",
+              "value": "={{ $env.SUBSTACK_PUBLISHER_EMAILS || '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {},
+        "includeOtherFields": true
+      }
+    },
+    {
+      "id": "93f813fc-a1d3-5630-bb49-16eb78486e66",
+      "name": "Parse subscriber email (Substack template)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// ALL Substack-email parsing lives in this one node. If Substack changes its\n// \"new subscriber\" notification template, this is the only thing to fix.\n// Every output item carries raw_body_excerpt so mismatches are easy to debug\n// from the execution log.\n// \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst EMAIL_RE = /[A-Z0-9._%+'-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi;\nconst IGNORED_DOMAINS = ['substack.com', 'substackmail.com', 'substackcdn.com'];\n// Notifications in the label that are not new sign-ups.\nconst SKIP_SUBJECT_RE = /unsubscribe|cancel|payment failed|refund/i;\n\nconst addr = v => String(v || '').trim().toLowerCase();\nconst listAddrs = field => ((field && field.value) || []).map(x => addr(x.address));\nconst isIgnoredDomain = email => {\n  const domain = email.split('@')[1] || '';\n  return IGNORED_DOMAINS.some(d => domain === d || domain.endsWith('.' + d));\n};\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const subject = j.subject || '';\n\n  const htmlAsText = j.html\n    ? j.html.replace(/<style[\\s\\S]*?<\\/style>/gi, ' ').replace(/<[^>]+>/g, ' ')\n    : '';\n  const body = String(j.text || htmlAsText || '')\n    .replace(/&#64;|&#x40;|&commat;|%40/gi, '@')\n    .replace(/&amp;/g, '&');\n\n  const own = new Set([\n    ...String(j._publisher_emails || '').split(',').map(addr).filter(Boolean),\n    ...listAddrs(j.from),\n    ...listAddrs(j.to),\n  ]);\n\n  const candidates = [...new Set(\n    (body.match(EMAIL_RE) || []).map(e => addr(e).replace(/[.'-]+$/, ''))\n  )].filter(e => !isIgnoredDomain(e) && !own.has(e));\n\n  const debug = {\n    gmail_message_id: j.id,\n    subject,\n    all_candidates: candidates,\n    raw_body_excerpt: body.replace(/\\s+/g, ' ').slice(0, 3000),\n  };\n  console.log('Substack parse', JSON.stringify(debug));\n\n  if (SKIP_SUBJECT_RE.test(subject)) continue;\n\n  if (candidates.length === 0) {\n    throw new Error('Could not find a subscriber email in Substack notification. ' + JSON.stringify(debug));\n  }\n\n  const email = candidates[0];\n\n  // Substack's notification is not a reliable source for the subscriber's name,\n  // so we only sync the email. Names can be filled in Attio by the team.\n  const name = null;\n\n  out.push({\n    json: {\n      email,\n      name,\n      source: 'Sparx Signal',\n      extra_values: {},\n      ambiguous: candidates.length > 1,\n      attio_assert_body: { data: { values: { email_addresses: [email] } } },\n      raw_payload: debug,\n      ...debug,\n    },\n  });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "66a1bf3a-3149-50ee-b2f9-0f0842816cb5",
+      "name": "Attio: upsert person by email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "method": "PUT",
+        "url": "https://api.attio.com/v2/objects/people/records",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "matching_attribute",
+              "value": "email_addresses"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.attio_assert_body) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "sparxAttioApi",
+          "name": "Attio API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "1013d8eb-4ebc-5de0-95ba-d3c3d083f427",
+      "name": "Build Attio update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Runs once per contact. Input = Attio's response to the upsert (PUT assert).\n// PATCH on Attio *appends* multi-select values, so adding the source tag never\n// removes tags from other sources.\nconst rec = $input.item.json.data;\nconst src = $('Parse subscriber email (Substack template)').item.json;\nconst v = rec.values || {};\n\nconst values = { ...(src.extra_values || {}) };\n\nconst existingSources = (v.source || []).map(s => s.option && s.option.title);\nif (!existingSources.includes(src.source)) values.source = [src.source];\n\nconst existingName = (v.name || [])[0];\nif (src.name && !(existingName && existingName.full_name)) values.name = [src.name];\n\nreturn {\n  json: {\n    record_id: rec.id.record_id,\n    email: src.email,\n    attio_patch_body: { data: { values } },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "26efd45d-e1b4-553f-a97a-7f23e349493c",
+      "name": "Attio: tag source / status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        200
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/objects/people/records/{{ $json.record_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.attio_patch_body) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "sparxAttioApi",
+          "name": "Attio API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "b623008d-ec5f-589d-9536-99d320ef99e7",
+      "name": "Log failed payload",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        420
+      ],
+      "parameters": {
+        "errorMessage": "=Substack \u2192 Attio \u2014 Attio call failed for {{ $('Parse subscriber email (Substack template)').item.json.email }}. Attio error: {{ JSON.stringify($json.error) }} | Original payload: {{ JSON.stringify($('Parse subscriber email (Substack template)').item.json.raw_payload) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Gmail: new Substack notification": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Parse subscriber email (Substack template)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse subscriber email (Substack template)": {
+      "main": [
+        [
+          {
+            "node": "Attio: upsert person by email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: upsert person by email": {
+      "main": [
+        [
+          {
+            "node": "Build Attio update",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log failed payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Attio update": {
+      "main": [
+        [
+          {
+            "node": "Attio: tag source / status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: tag source / status": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Log failed payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

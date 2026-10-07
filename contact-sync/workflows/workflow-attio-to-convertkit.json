@@ -1,0 +1,396 @@
+{
+  "name": "Sparx | Attio \u2192 Kit (Send Outbound)",
+  "nodes": [
+    {
+      "id": "ed976571-a4f1-5c7f-8525-00088c4f5805",
+      "name": "Every 15 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "08423c3c-9152-5d79-8882-c22d5af4a9b8",
+      "name": "Attio: find Send Outbound people",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.attio.com/v2/objects/people/records/query",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"filter\": {\n    \"$and\": [\n      {\n        \"outbound_status\": \"Send Outbound\"\n      },\n      {\n        \"synced_to_convertkit\": false\n      }\n    ]\n  },\n  \"limit\": 100\n}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "sparxAttioApi",
+          "name": "Attio API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "2348f3cf-a0bd-535e-b4ac-90c69a29be06",
+      "name": "Prepare contacts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Flattens Attio's query response into one item per contact.\n// Attio returns every attribute as an array of value objects.\nconst out = [];\nfor (const item of $input.all()) {\n  for (const rec of item.json.data || []) {\n    const v = rec.values || {};\n    // Belt and braces: never re-send someone already marked as synced.\n    if ((v.synced_to_convertkit || [])[0]?.value === true) continue;\n\n    const email = (v.email_addresses || [])[0]?.email_address;\n    if (!email) {\n      console.log('Skipping Attio record with no email:', rec.id.record_id);\n      continue;\n    }\n    const name = (v.name || [])[0] || {};\n    out.push({\n      json: {\n        record_id: rec.id.record_id,\n        email: email.trim().toLowerCase(),\n        first_name: name.first_name || '',\n      },\n    });\n  }\n}\n// Returning nothing ends the run quietly when there is no one to send.\nreturn out;\n"
+      }
+    },
+    {
+      "id": "5028961d-a58a-5c02-b9ae-414830e19f80",
+      "name": "Loop over contacts",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "98154783-05bd-5d90-afb4-40af736b6c9e",
+      "name": "Kit: create/update subscriber",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        400
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.kit.com/v4/subscribers",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email_address: $json.email, first_name: $json.first_name || undefined, state: 'active' }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "sparxKitApi",
+          "name": "Kit API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "6298b10d-7f29-5733-a167-ba53298fda3b",
+      "name": "Kit: add to outbound sequence",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        400
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.kit.com/v4/sequences/{{ $env.KIT_SEQUENCE_ID }}/subscribers",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email_address: $('Loop over contacts').item.json.email }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "sparxKitApi",
+          "name": "Kit API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "5a9000ce-a690-5ed9-b47e-db9b87122703",
+      "name": "Attio: mark synced_to_convertkit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        400
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/objects/people/records/{{ $('Loop over contacts').item.json.record_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"data\": {\"values\": {\"synced_to_convertkit\": true}}}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "sparxAttioApi",
+          "name": "Attio API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "ee10a9f9-c2d1-5fb6-8889-97ce37707993",
+      "name": "Mark OK",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1560,
+        380
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "bd37860d-eee6-5b20-9f2b-69c21a6090f5",
+              "name": "email",
+              "value": "={{ $('Loop over contacts').item.json.email }}",
+              "type": "string"
+            },
+            {
+              "id": "4f1db530-994b-5447-a941-e890e0aa6022",
+              "name": "sync_failed",
+              "value": false,
+              "type": "boolean"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "59600cef-d72a-5349-a04d-dbd3d6060e00",
+      "name": "Mark failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1560,
+        600
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e2e7a41d-0a20-5317-9387-f94bae1ab451",
+              "name": "email",
+              "value": "={{ $('Loop over contacts').item.json.email }}",
+              "type": "string"
+            },
+            {
+              "id": "0f9eb128-8449-54b7-8299-b701b56f1c6e",
+              "name": "record_id",
+              "value": "={{ $('Loop over contacts').item.json.record_id }}",
+              "type": "string"
+            },
+            {
+              "id": "99bd69a2-db50-5868-a84b-f69274ac77d2",
+              "name": "sync_failed",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "2781b9ef-30ff-5d21-84e4-07cc581b05ce",
+              "name": "error",
+              "value": "={{ $json.error?.message || JSON.stringify($json.error) }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "6c6c2b05-b32c-502a-8caf-1eda80ce4139",
+      "name": "Fail run if any contact failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// Failed contacts keep synced_to_convertkit = false, so they are retried on the\n// next poll. Throwing here marks the execution red in n8n's history with the\n// list of who failed and why.\nconst items = $input.all();\nconst failed = items.filter(i => i.json.sync_failed);\nif (failed.length) {\n  throw new Error(\n    `${failed.length} of ${items.length} contact(s) failed to sync to Kit (will retry next run): ` +\n    failed.map(f => `${f.json.email}: ${f.json.error}`).join(' | ')\n  );\n}\nreturn [{ json: { synced: items.length } }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Every 15 minutes": {
+      "main": [
+        [
+          {
+            "node": "Attio: find Send Outbound people",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: find Send Outbound people": {
+      "main": [
+        [
+          {
+            "node": "Prepare contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare contacts": {
+      "main": [
+        [
+          {
+            "node": "Loop over contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop over contacts": {
+      "main": [
+        [
+          {
+            "node": "Fail run if any contact failed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Kit: create/update subscriber",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kit: create/update subscriber": {
+      "main": [
+        [
+          {
+            "node": "Kit: add to outbound sequence",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kit: add to outbound sequence": {
+      "main": [
+        [
+          {
+            "node": "Attio: mark synced_to_convertkit",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: mark synced_to_convertkit": {
+      "main": [
+        [
+          {
+            "node": "Mark OK",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark OK": {
+      "main": [
+        [
+          {
+            "node": "Loop over contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark failed": {
+      "main": [
+        [
+          {
+            "node": "Loop over contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

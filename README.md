@@ -2,6 +2,8 @@
 
 An AI-powered prospect research and outreach pipeline for Sparx Labs' "AI for Entrepreneurs" course. The system automatically discovers potential customers, researches them across the web, scores their fit, drafts personalized outreach, and syncs qualified leads to Attio CRM and Apollo email sequences — with a human-in-the-loop approval step before any outreach is sent.
 
+> **Also in this repo:** [`contact-sync/`](contact-sync/README.md) — the self-hosted n8n setup that syncs contacts between Attio, Kit (ConvertKit) and Substack. It is independent of the app below.
+
 ---
 
 ## What It Does

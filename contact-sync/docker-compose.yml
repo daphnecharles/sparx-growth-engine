@@ -1,0 +1,72 @@
+# Sparx Labs Marketing Contact Sync — n8n behind Caddy (automatic HTTPS).
+#
+#   cp .env.example .env   # then fill in every value
+#   docker compose up -d
+#
+# Both images are multi-arch and run natively on Oracle's Ampere (arm64) shapes.
+
+services:
+  caddy:
+    image: caddy:2.11.7
+    restart: unless-stopped
+    ports:
+      - "80:80"       # needed for the Let's Encrypt HTTP-01 challenge + redirect to HTTPS
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      N8N_DOMAIN: ${N8N_DOMAIN:?set N8N_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:?set BASIC_AUTH_USER in .env}
+      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH:?set BASIC_AUTH_HASH in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data     # issued certificates — keep this so we don't hit LE rate limits
+      - caddy_config:/config
+    depends_on:
+      - n8n
+
+  n8n:
+    image: n8nio/n8n:2.42.4 # pinned; bump deliberately after reading the n8n release notes
+    restart: unless-stopped
+    # No published ports: n8n is only reachable through Caddy.
+    expose:
+      - "5678"
+    environment:
+      # --- Public URL (so webhook URLs shown in the editor are the real ones) ---
+      N8N_HOST: ${N8N_DOMAIN}
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://${N8N_DOMAIN}/
+      N8N_EDITOR_BASE_URL: https://${N8N_DOMAIN}/
+      N8N_PROXY_HOPS: "1" # trust X-Forwarded-* from Caddy
+
+      # --- Security ---
+      # Encrypts every credential (API keys, Gmail OAuth tokens) stored in n8n_data.
+      # Losing this key = re-entering every credential. Back it up in the password manager.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      N8N_SECURE_COOKIE: "true"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+
+      # --- Time zone (schedule triggers + execution timestamps) ---
+      GENERIC_TIMEZONE: ${TIMEZONE:-America/New_York}
+      TZ: ${TIMEZONE:-America/New_York}
+
+      # --- Execution history (our "logging system") ---
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "720" # hours (30 days)
+
+      # --- Non-secret workflow config, read via {{ $env.X }} in node expressions ---
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      WEBHOOK_SHARED_SECRET: ${WEBHOOK_SHARED_SECRET:?set WEBHOOK_SHARED_SECRET in .env}
+      KIT_SEQUENCE_ID: ${KIT_SEQUENCE_ID:-}
+      SUBSTACK_PUBLISHER_EMAILS: ${SUBSTACK_PUBLISHER_EMAILS:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
+  caddy_data:
+  caddy_config:

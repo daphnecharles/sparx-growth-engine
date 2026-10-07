@@ -1,0 +1,7 @@
+# Real secrets never get committed. The root .gitignore ignores `.env.*`,
+# so re-include the template explicitly.
+.env
+!.env.example
+
+# Local workflow backups (store these in the shared Drive / private repo instead)
+backups/

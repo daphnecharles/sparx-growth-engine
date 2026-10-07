@@ -1,0 +1,19 @@
+# Caddy obtains and renews the Let's Encrypt certificate for N8N_DOMAIN automatically
+# (DNS must already point at this VM and ports 80/443 must be open).
+{
+	email {$ACME_EMAIL}
+}
+
+{$N8N_DOMAIN} {
+	encode zstd gzip
+
+	# Basic auth on the editor/UI. Webhook paths are left open because Kit
+	# cannot send basic-auth credentials; those workflows check a shared
+	# secret token in the URL instead (see README → "Webhook security").
+	@editor not path /webhook/* /webhook-test/* /webhook-waiting/*
+	basic_auth @editor {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+
+	reverse_proxy n8n:5678
+}

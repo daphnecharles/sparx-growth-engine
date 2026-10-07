@@ -1,0 +1,283 @@
+{
+  "name": "Sparx | Kit \u2192 Attio (new subscribers)",
+  "nodes": [
+    {
+      "id": "591adc15-0bc3-51d2-b679-b9fc3dcee2b9",
+      "name": "Kit: subscriber activated",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "kit-subscriber-activate",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "b403830d-158c-51c4-8157-f90c2b0090a3"
+    },
+    {
+      "id": "fcb90996-2369-5720-af91-c836841f4be3",
+      "name": "Valid token?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "dec56895-7544-52da-aef1-73dda7112b46",
+              "leftValue": "={{ $env.WEBHOOK_SHARED_SECRET }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "26ef4cc1-ef27-5173-a122-a6389e72f73f",
+              "leftValue": "={{ $json.query.token }}",
+              "rightValue": "={{ $env.WEBHOOK_SHARED_SECRET }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "7ebf9300-c3fe-5969-8b8c-dcbe53e486ff",
+      "name": "Reject: bad token",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        440,
+        480
+      ],
+      "parameters": {
+        "errorMessage": "Rejected Kit webhook: missing/invalid ?token=. Check WEBHOOK_SHARED_SECRET and the URL registered in Kit."
+      }
+    },
+    {
+      "id": "afca79d7-da53-5576-ac15-32ebbdf1dbb8",
+      "name": "Map Kit subscriber",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        280
+      ],
+      "parameters": {
+        "jsCode": "// Kit webhook payload: { subscriber: { id, first_name, email_address, state, fields: {...} } }\nreturn $input.all().map(item => {\n  const body = item.json.body || {};\n  const sub = body.subscriber || {};\n  const email = String(sub.email_address || '').trim().toLowerCase();\n  if (!email) {\n    throw new Error('Kit payload had no subscriber.email_address: ' + JSON.stringify(body));\n  }\n\n  const fields = sub.fields || {};\n  const first = String(sub.first_name || fields.first_name || '').trim();\n  const last = String(fields.last_name || '').trim();\n  const name = (first || last)\n    ? { first_name: first, last_name: last, full_name: [first, last].filter(Boolean).join(' ') }\n    : null;\n\n  return {\n    json: {\n      email,\n      name,\n      source: 'ConvertKit',\n      // A (re)activation means they are subscribed again.\n      extra_values: { email_status: 'Subscribed' },\n      // Only the email goes in the upsert; everything else is set afterwards so we\n      // never overwrite data the team maintains in Attio.\n      attio_assert_body: { data: { values: { email_addresses: [email] } } },\n      raw_payload: body,\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "c7046916-cfca-5186-b2d5-bdfdd6c5e7d3",
+      "name": "Attio: upsert person by email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        280
+      ],
+      "parameters": {
+        "method": "PUT",
+        "url": "https://api.attio.com/v2/objects/people/records",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "matching_attribute",
+              "value": "email_addresses"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.attio_assert_body) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "sparxAttioApi",
+          "name": "Attio API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "4bc55d80-979d-5e81-9af8-3124b08e3244",
+      "name": "Build Attio update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        180
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Runs once per contact. Input = Attio's response to the upsert (PUT assert).\n// PATCH on Attio *appends* multi-select values, so adding the source tag never\n// removes tags from other sources.\nconst rec = $input.item.json.data;\nconst src = $('Map Kit subscriber').item.json;\nconst v = rec.values || {};\n\nconst values = { ...(src.extra_values || {}) };\n\nconst existingSources = (v.source || []).map(s => s.option && s.option.title);\nif (!existingSources.includes(src.source)) values.source = [src.source];\n\nconst existingName = (v.name || [])[0];\nif (src.name && !(existingName && existingName.full_name)) values.name = [src.name];\n\nreturn {\n  json: {\n    record_id: rec.id.record_id,\n    email: src.email,\n    attio_patch_body: { data: { values } },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "8777dcfb-d0c7-5ddd-b225-e4c8f6160820",
+      "name": "Attio: tag source / status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        180
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/objects/people/records/{{ $json.record_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.attio_patch_body) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "sparxAttioApi",
+          "name": "Attio API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "e186303d-eb6c-5218-913a-092ceb5ff3be",
+      "name": "Log failed payload",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        400
+      ],
+      "parameters": {
+        "errorMessage": "=Kit \u2192 Attio \u2014 Attio call failed for {{ $('Map Kit subscriber').item.json.email }}. Attio error: {{ JSON.stringify($json.error) }} | Original payload: {{ JSON.stringify($('Map Kit subscriber').item.json.raw_payload) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Kit: subscriber activated": {
+      "main": [
+        [
+          {
+            "node": "Valid token?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid token?": {
+      "main": [
+        [
+          {
+            "node": "Map Kit subscriber",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject: bad token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Kit subscriber": {
+      "main": [
+        [
+          {
+            "node": "Attio: upsert person by email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: upsert person by email": {
+      "main": [
+        [
+          {
+            "node": "Build Attio update",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log failed payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Attio update": {
+      "main": [
+        [
+          {
+            "node": "Attio: tag source / status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: tag source / status": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Log failed payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
